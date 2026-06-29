@@ -15,6 +15,7 @@ cp -rf config.yaml "${HERMES_HOME}/config.yaml"
 # Expose the API server layout globally 
 export API_SERVER_ENABLED=false
 export API_SERVER_HOST=0.0.0.0 # Allows connections outside localhost
+export API_SERVER_PORT=8642
 if [ "${API_SERVER_ENABLED}" = "true" ] && [ -z "${API_SERVER_KEY:-}" ]; then
   API_SERVER_KEY_FILE="${HERMES_HOME}/api_server_key"
   if [ ! -s "$API_SERVER_KEY_FILE" ]; then

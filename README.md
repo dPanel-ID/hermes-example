@@ -73,12 +73,14 @@ HTTP endpoint.
 ```bash
 API_SERVER_ENABLED=true
 API_SERVER_HOST=127.0.0.1
+API_SERVER_PORT=8642
 API_SERVER_KEY=strong_random_secret
 ```
 
 Use `127.0.0.1` for local-only access. Use `0.0.0.0` only behind a firewall or
-trusted private network. If `API_SERVER_KEY` is not set, `scripts/start.sh`
-generates one at `.hermes/api_server_key`.
+trusted private network. `API_SERVER_PORT` controls the HTTP port. If
+`API_SERVER_KEY` is not set, `scripts/start.sh` generates one at
+`.hermes/api_server_key`.
 
 When exposing the API server on the network, consider changing:
 
