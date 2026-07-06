@@ -9,9 +9,6 @@ echo "Installing Hermes Agent to ${HERMES_HOME}..."
 # always copy the config.yaml to the hermes home directory
 cp -rf config.yaml "${HERMES_HOME}/config.yaml"
 
-# INJECT the enablement configurations directly into your fresh copy
-"$VENV_HERMES" config set platforms.telegram.enabled true
-
 # Expose the API server layout globally 
 export API_SERVER_ENABLED=false
 export API_SERVER_HOST=0.0.0.0 # Allows connections outside localhost
@@ -37,4 +34,4 @@ export OPENAI_API_KEY=sk-project-1-0-0-
 # Anthropic API key configuration
 export ANTHROPIC_API_KEY=sk-anthropic-1-0-0-
 
-exec "$VENV_HERMES" gateway run --replace --accept-hooks
+"$VENV_HERMES" gateway run --replace --accept-hooks
