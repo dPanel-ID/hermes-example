@@ -1,6 +1,8 @@
 model:
-  default: gpt-4o-mini
-  provider: openai-api
+  # default: gpt-4o-mini
+  # provider: openai-api
+  default: MBZUAI-IFM/K2-Think-v2
+  provider: custom:k2think
 agent:
   max_turns: 90
   disabled_toolsets:
@@ -203,6 +205,11 @@ smart_model_routing:
 known_plugin_toolsets:
   cli:
     - spotify
+
+custom_providers:
+  - name: k2think
+    base_url: "https://api.k2think.ai/v1"
+    key_env: K2THINK_API_KEY
 
 # ── Security ──────────────────────────────────────────────────────────
 # Secret redaction is ON by default — strings that look like API keys,
