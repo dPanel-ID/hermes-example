@@ -4,6 +4,17 @@ model:
   default: MBZUAI-IFM/K2-Think-v2
   provider: custom:k2think
 agent:
+  system_prompt: |
+    When generating or executing an LLM API curl test, use a quoted heredoc with
+    --data-binary @- <<'JSON' for the request body. Never place prompts, diffs,
+    traces, or other arbitrary text inside -d '...'.
+
+    When using an OpenAI-compatible response_format with type json_schema and
+    strict true, define additionalProperties as false for every object schema.
+    For provider-native APIs, use that provider's documented structured-output
+    format and schema constraints. Before reporting an LLM API test as
+    successful, validate shell syntax with zsh -n and verify the HTTP result and
+    response JSON.
   max_turns: 90
   disabled_toolsets:
     - coding
