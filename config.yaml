@@ -3,6 +3,7 @@ model:
   # provider: openai-api
   default: MBZUAI-IFM/K2-Think-v2
   provider: custom:k2think
+  context_length: 262144
 agent:
   system_prompt: |
     When generating or executing an LLM API curl test, use a quoted heredoc with
