@@ -16,6 +16,9 @@ rules dPanel's assistant applies (dPanel backend internal/ai/horizon):
 - requests start at least 1.1 seconds apart
 - 429 (honouring Retry-After), 500, 502, 503, 504 and 529 are retried up to
   three attempts, before any byte is sent back
+- requests that set no sampling get dPanel's: temperature 0.2, top_p 0.95
+  and at most IFM_DEFAULT_MAX_TOKENS (4096) completion tokens; without them
+  the model sometimes reasons until the token limit and never answers
 - an answer whose content carries the model's reasoning followed by
   </ifm|think> (the gateway does this for some requests with tools) is split:
   the reasoning goes to reasoning_content, only the answer stays in content,
@@ -45,6 +48,10 @@ MAX_BACKOFF = 60.0
 MAX_BODY = 16 << 20
 TIMEOUT = 180
 RETRYABLE = {429, 500, 502, 503, 504, 529}
+# Sampling dPanel's assistant sends (backend internal/ai/horizon/model.go).
+DEFAULT_TEMPERATURE = 0.2
+DEFAULT_TOP_P = 0.95
+DEFAULT_MAX_TOKENS = int(os.environ.get("IFM_DEFAULT_MAX_TOKENS", "4096"))
 # Hop-by-hop and recomputed headers are not forwarded.
 SKIP_HEADERS = {"host", "content-length", "connection", "keep-alive", "transfer-encoding", "accept-encoding"}
 
@@ -133,6 +140,10 @@ class StreamFixer:
         self.template = event
         choice = choices[0]
         delta = choice.get("delta") or {}
+        if not self.held and (delta.get("reasoning_content") or delta.get("reasoning")):
+            # The gateway separates reasoning in this answer: nothing to hold back.
+            self.passing = True
+            return [line + b"\n"]
         content = delta.pop("content", None)
         out = []
         if content:
@@ -216,6 +227,10 @@ def normalize_body(body):
     if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
         raise ContractError("unsupported_role", "Horizon Chat Completions requests require an array of messages.")
     normalize_messages(payload["messages"])
+    payload.setdefault("temperature", DEFAULT_TEMPERATURE)
+    payload.setdefault("top_p", DEFAULT_TOP_P)
+    if "max_tokens" not in payload and "max_completion_tokens" not in payload:
+        payload["max_tokens"] = DEFAULT_MAX_TOKENS
     return json.dumps(payload).encode()
 
 
@@ -286,6 +301,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 body = normalize_body(body)
             except ContractError as err:
+                sys.stderr.write(f"ifm-proxy refused request: {err.code}: {err.message}\n")
                 self.send_json(400, {"error": {"message": err.message, "type": "invalid_request_error", "code": err.code}})
                 return
         headers = {k: v for k, v in self.headers.items() if k.lower() not in SKIP_HEADERS}

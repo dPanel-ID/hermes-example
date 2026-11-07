@@ -19,6 +19,10 @@ assistant uses. Set `IFM_API_KEY`. `scripts/start.sh` starts
 text-only content, `developer` sent as `system`, `reasoning_content` and
 `reasoning` on every assistant message, tool messages that reference an
 earlier tool call, requests at least 1.1 s apart and retries on 429/5xx.
+It also sends dPanel's sampling (temperature 0.2, top_p 0.95, at most 4096
+completion tokens, `IFM_DEFAULT_MAX_TOKENS` to change) when Hermes sets none:
+without it the model sometimes reasons until the token limit and never
+answers.
 
 To use another provider instead:
 
