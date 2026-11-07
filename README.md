@@ -12,6 +12,16 @@ OpenAI-compatible API server.
 
 ## LLM Configuration
 
+This example uses IFM Horizon (`IFM/K2-Horizon-375B-A23B`), the model dPanel's
+assistant uses. Set `IFM_API_KEY`. `scripts/start.sh` starts
+`scripts/ifm_proxy.py` on `127.0.0.1:8650`, which forwards to
+`https://api.ifm.ai/v1` and applies IFM's API contract the way dPanel does:
+text-only content, `developer` sent as `system`, `reasoning_content` and
+`reasoning` on every assistant message, tool messages that reference an
+earlier tool call, requests at least 1.1 s apart and retries on 429/5xx.
+
+To use another provider instead:
+
 Set the default model and provider in `config.yaml`:
 
 ```yaml

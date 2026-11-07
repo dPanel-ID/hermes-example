@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""Local proxy that makes OpenAI-compatible clients follow the IFM Horizon contract.
+
+Hermes talks to http://127.0.0.1:${IFM_PROXY_PORT}/v1 as a plain
+OpenAI-compatible provider. This proxy forwards each request to the IFM
+gateway (IFM_BASE_URL, default https://api.ifm.ai/v1) and applies the same
+rules dPanel's assistant applies (dPanel backend internal/ai/horizon):
+
+- message content is text only; text content-part arrays are joined with
+  newlines, any other part is refused with a 400
+- "developer" messages are sent as "system"; legacy "function" messages are
+  refused
+- every assistant message carries reasoning_content and reasoning ("" when
+  unknown)
+- a tool message must reference a tool call of an earlier assistant message
+- requests start at least 1.1 seconds apart
+- 429 (honouring Retry-After), 500, 502, 503, 504 and 529 are retried up to
+  three attempts, before any byte is sent back
+
+The client's Authorization header is passed through, so the proxy never holds
+the API key. It listens on 127.0.0.1 only and needs nothing beyond the Python
+standard library.
+"""
+
+import http.client
+import json
+import os
+import random
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
+
+UPSTREAM = os.environ.get("IFM_BASE_URL", "https://api.ifm.ai/v1").rstrip("/")
+PORT = int(os.environ.get("IFM_PROXY_PORT", "8650"))
+REQUEST_INTERVAL = 1.1
+MAX_ATTEMPTS = 3
+MAX_BACKOFF = 60.0
+MAX_BODY = 16 << 20
+TIMEOUT = 180
+RETRYABLE = {429, 500, 502, 503, 504, 529}
+# Hop-by-hop and recomputed headers are not forwarded.
+SKIP_HEADERS = {"host", "content-length", "connection", "keep-alive", "transfer-encoding", "accept-encoding"}
+
+_upstream = urlsplit(UPSTREAM)
+_pace_lock = threading.Lock()
+_next_start = 0.0
+
+
+class ContractError(Exception):
+    """A request the IFM contract does not allow."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def text_content(content):
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "text" or not isinstance(part.get("text"), str):
+                kind = part.get("type", "unknown") if isinstance(part, dict) else "unknown"
+                raise ContractError("unsupported_content_part", f"Horizon supports text content only; received a {kind} content part.")
+            parts.append(part["text"])
+        return "\n".join(parts)
+    raise ContractError("unsupported_content_part", "Horizon supports text content only.")
+
+
+def normalize_messages(messages):
+    seen_tool_calls = set()
+    for message in messages:
+        if not isinstance(message, dict):
+            raise ContractError("unsupported_role", "Every message must be an object.")
+        role = message.get("role")
+        if role == "developer":
+            message["role"] = role = "system"
+        if role in ("system", "user"):
+            message["content"] = text_content(message.get("content"))
+        elif role == "assistant":
+            message["content"] = text_content(message.get("content"))
+            for call in message.get("tool_calls") or []:
+                call_id = (call or {}).get("id") or ""
+                name = ((call or {}).get("function") or {}).get("name") or ""
+                if not call_id.strip() or not name.strip():
+                    raise ContractError("invalid_tool_call", "Tool calls require a non-empty id and function name.")
+                seen_tool_calls.add(call_id)
+            reasoning = message.get("reasoning_content")
+            if not isinstance(reasoning, str):
+                reasoning = message.get("reasoning") if isinstance(message.get("reasoning"), str) else ""
+            message["reasoning_content"] = reasoning
+            message["reasoning"] = reasoning
+        elif role == "tool":
+            call_id = message.get("tool_call_id") or ""
+            if not call_id.strip() or call_id not in seen_tool_calls:
+                raise ContractError("unknown_tool_call_reference", "Tool messages must reference a preceding assistant tool call.")
+            message["content"] = text_content(message.get("content"))
+        elif role == "function":
+            raise ContractError("unsupported_role", "Legacy function messages are not supported. Use assistant tool calls and tool messages instead.")
+        else:
+            raise ContractError("unsupported_role", f"Horizon does not support the {role} message role.")
+    return messages
+
+
+def normalize_body(body):
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        raise ContractError("unsupported_role", "Request body is not a JSON object.")
+    if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
+        raise ContractError("unsupported_role", "Horizon Chat Completions requests require an array of messages.")
+    normalize_messages(payload["messages"])
+    return json.dumps(payload).encode()
+
+
+def wait_for_slot():
+    """Reserve the next start slot, then sleep outside the lock."""
+    global _next_start
+    with _pace_lock:
+        now = time.monotonic()
+        start = max(now, _next_start)
+        _next_start = start + REQUEST_INTERVAL
+    delay = start - time.monotonic()
+    if delay > 0:
+        time.sleep(delay)
+
+
+def retry_delay(status, headers, attempt):
+    retry_after = headers.get("Retry-After")
+    if status == 429 and retry_after:
+        try:
+            return min(float(retry_after), MAX_BACKOFF)
+        except ValueError:
+            pass
+    base = 2.0 if status == 529 else 1.0
+    delay = base * (2 ** (attempt - 1))
+    return min(delay + random.uniform(0, delay / 4), MAX_BACKOFF)
+
+
+def open_upstream(method, path, body, headers):
+    connection_class = http.client.HTTPSConnection if _upstream.scheme == "https" else http.client.HTTPConnection
+    connection = connection_class(_upstream.netloc, timeout=TIMEOUT)
+    connection.request(method, _upstream.path + path, body=body, headers=headers)
+    return connection, connection.getresponse()
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        # Method, path and status only; never headers or bodies.
+        sys.stderr.write("ifm-proxy %s\n" % (fmt % args))
+
+    def send_json(self, status, payload):
+        data = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def forward(self, method):
+        if not self.path.startswith("/v1"):
+            self.send_json(404, {"error": {"message": "not found", "type": "invalid_request_error"}})
+            return
+        path = self.path[len("/v1"):]
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > MAX_BODY:
+            self.send_json(413, {"error": {"message": "request body too large", "type": "invalid_request_error"}})
+            return
+        body = self.rfile.read(length) if length else None
+        if method == "POST" and path.rstrip("/").endswith("/chat/completions") and body:
+            try:
+                body = normalize_body(body)
+            except ContractError as err:
+                self.send_json(400, {"error": {"message": err.message, "type": "invalid_request_error", "code": err.code}})
+                return
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in SKIP_HEADERS}
+        if body is not None:
+            headers["Content-Length"] = str(len(body))
+
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            wait_for_slot()
+            try:
+                connection, response = open_upstream(method, path, body, headers)
+            except OSError as err:
+                if attempt == MAX_ATTEMPTS:
+                    self.send_json(502, {"error": {"message": f"IFM gateway unreachable: {type(err).__name__}", "type": "api_error"}})
+                    return
+                time.sleep(retry_delay(502, {}, attempt))
+                continue
+            if response.status in RETRYABLE and attempt < MAX_ATTEMPTS:
+                response.read()
+                connection.close()
+                time.sleep(retry_delay(response.status, response.headers, attempt))
+                continue
+            self.relay(response)
+            connection.close()
+            return
+
+    def relay(self, response):
+        """Stream the gateway's answer back as it arrives (SSE included)."""
+        self.send_response(response.status)
+        for key, value in response.getheaders():
+            if key.lower() not in SKIP_HEADERS:
+                self.send_header(key, value)
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        while True:
+            chunk = response.read1(65536) if hasattr(response, "read1") else response.read(65536)
+            if not chunk:
+                break
+            self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
+            self.wfile.flush()
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
+
+    def do_GET(self):
+        self.forward("GET")
+
+    def do_POST(self):
+        self.forward("POST")
+
+
+def main():
+    server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    server.daemon_threads = True
+    sys.stderr.write(f"ifm-proxy listening on 127.0.0.1:{PORT}, forwarding to {UPSTREAM}\n")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

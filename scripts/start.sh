@@ -28,13 +28,30 @@ fi
 # export TELEGRAM_ALLOWED_USERS=
 # Telegram bot configuration
 
-# K2Think API key configuration
-# export K2THINK_API_KEY=IFM-1-0-0-
+# IFM API key configuration (set IFM_API_KEY in the environment; K2THINK_API_KEY
+# still works for older setups)
+export IFM_API_KEY="${IFM_API_KEY:-${K2THINK_API_KEY:-}}"
+if [ -z "${IFM_API_KEY}" ]; then
+  echo "IFM_API_KEY is not set" >&2
+  exit 1
+fi
 
 # OpenAI API key configuration
 # export OPENAI_API_KEY=sk-project-1-0-0-
 
 # Anthropic API key configuration
 # export ANTHROPIC_API_KEY=sk-anthropic-1-0-0-
+
+# The IFM contract proxy runs beside the gateway and stops with it.
+export IFM_PROXY_PORT="${IFM_PROXY_PORT:-8650}"
+python3 "${CURRENT_DIR}/scripts/ifm_proxy.py" &
+IFM_PROXY_PID=$!
+trap 'kill "${IFM_PROXY_PID}" 2>/dev/null' EXIT INT TERM
+for _ in $(seq 1 50); do
+  if (exec 3<>"/dev/tcp/127.0.0.1/${IFM_PROXY_PORT}") 2>/dev/null; then
+    break
+  fi
+  sleep 0.1
+done
 
 "$VENV_HERMES" gateway run --replace --accept-hooks

@@ -1,9 +1,11 @@
 model:
   # default: gpt-4o-mini
   # provider: openai-api
-  default: MBZUAI-IFM/K2-Think-v2
-  provider: custom:k2think
-  context_length: 262144
+  # IFM Horizon, the model dPanel's assistant uses. Requests go through
+  # scripts/ifm_proxy.py, which applies IFM's API contract.
+  default: IFM/K2-Horizon-375B-A23B
+  provider: custom:ifm
+  context_length: 131072
 agent:
   system_prompt: |
     When generating or executing an LLM API curl test, use a quoted heredoc with
@@ -229,9 +231,13 @@ known_plugin_toolsets:
     - spotify
 
 custom_providers:
-  - name: k2think
-    base_url: "https://api.ifm.ai/v1"
-    key_env: K2THINK_API_KEY
+  # scripts/start.sh runs scripts/ifm_proxy.py on 127.0.0.1:8650; it forwards
+  # to https://api.ifm.ai/v1 following IFM's contract (text-only content,
+  # developer -> system, reasoning fields on assistant messages, tool-call
+  # references, 1.1 s pacing, retries).
+  - name: ifm
+    base_url: "http://127.0.0.1:8650/v1"
+    key_env: IFM_API_KEY
 
 # ── Security ──────────────────────────────────────────────────────────
 # Secret redaction is ON by default — strings that look like API keys,
