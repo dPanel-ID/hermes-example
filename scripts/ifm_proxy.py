@@ -23,6 +23,8 @@ rules dPanel's assistant applies (dPanel backend internal/ai/horizon):
   answers this proxy relayed (matched by tool call id, else by content): the
   model needs its earlier reasoning, and without it after tool calls it can
   end with finish_reason tool_calls but no tool call and no answer
+- text the gateway left in the reasoning after </ifm|think> is the answer,
+  so it is moved to content (an empty answer otherwise)
 - an answer whose content carries the model's reasoning followed by
   </ifm|think> (the gateway does this for some requests with tools) is split:
   the reasoning goes to reasoning_content, only the answer stays in content,
@@ -84,8 +86,26 @@ def split_reasoning(content):
     return reasoning, answer
 
 
+def reasoning_tail(reasoning):
+    """Split reasoning at its last closing think tag: (reasoning, answer text
+    after the tag). The answer is "" when nothing follows the tag."""
+    index = reasoning.rfind(THINK_CLOSE)
+    if index < 0:
+        return reasoning, ""
+    return reasoning[:index + len(THINK_CLOSE)], reasoning[index + len(THINK_CLOSE):].strip()
+
+
 def fix_message(message):
-    """Move leaked reasoning out of a non-streamed assistant message."""
+    """Move leaked reasoning out of a non-streamed assistant message, and an
+    answer left in the reasoning after the closing tag into content."""
+    for key in ("reasoning_content", "reasoning"):
+        if isinstance(message.get(key), str) and THINK_CLOSE in message[key]:
+            kept, answer = reasoning_tail(message[key])
+            if answer:
+                content = message.get("content") if isinstance(message.get("content"), str) else ""
+                message["content"] = (answer + ("\n" + content if content.strip() else "")).strip()
+                message["reasoning_content"] = message["reasoning"] = kept
+            break
     content = message.get("content")
     if not isinstance(content, str):
         return
@@ -175,6 +195,38 @@ class StreamFixer:
         self.held = ""
         self.passing = False
         self.template = None
+        # Reasoning seen so far (the tail is enough to find a split tag) and
+        # whether the closing tag has passed: reasoning after it is answer.
+        self.reasoning_tail = ""
+        self.after_tag = False
+
+    def _move_reasoning_tail(self, delta):
+        """Turn reasoning that follows the closing think tag into content."""
+        for key in ("reasoning_content", "reasoning"):
+            text = delta.get(key)
+            if not isinstance(text, str) or not text:
+                continue
+            if self.after_tag:
+                delta.pop("reasoning_content", None)
+                delta.pop("reasoning", None)
+                delta["content"] = (delta.get("content") or "") + text
+                return
+            window = self.reasoning_tail + text
+            index = window.find(THINK_CLOSE)
+            self.reasoning_tail = window[-len(THINK_CLOSE):]
+            if index < 0:
+                return
+            self.after_tag = True
+            split = index + len(THINK_CLOSE) - (len(window) - len(text))
+            before, after = text[:max(split, 0)], text[max(split, 0):]
+            if before:
+                delta["reasoning_content"] = delta["reasoning"] = before
+            else:
+                delta.pop("reasoning_content", None)
+                delta.pop("reasoning", None)
+            if after.strip():
+                delta["content"] = (delta.get("content") or "") + after.lstrip()
+            return
 
     def _event(self, delta, finish_reason=None):
         event = {key: self.template[key] for key in ("id", "object", "created", "model") if key in self.template}
@@ -209,6 +261,13 @@ class StreamFixer:
         except ValueError:
             return [line + b"\n"]
         choices = event.get("choices") or []
+        if choices:
+            delta = choices[0].get("delta") or {}
+            before = json.dumps(delta, sort_keys=True)
+            self._move_reasoning_tail(delta)
+            if json.dumps(delta, sort_keys=True) != before:
+                choices[0]["delta"] = delta
+                line = b"data: " + json.dumps(event).encode()
         if self.passing or not choices:
             return [line + b"\n"]
         self.template = event
@@ -260,7 +319,11 @@ def text_content(content):
 
 def log_answer(finish_reason, content, reasoning, tool_call_ids):
     """One line per answer: sizes and outcome, never the text."""
-    note = " EMPTY" if not content and not tool_call_ids else ""
+    note = ""
+    if not content and not tool_call_ids:
+        _, after = reasoning_tail(reasoning)
+        shape = "tool-call-like" if after.lstrip()[:1] in ("<", "{", "[") else "text"
+        note = f" EMPTY tag_in_reasoning={THINK_CLOSE in reasoning} after_tag={len(after)}" + (f" after_tag_shape={shape}" if after else "")
     sys.stderr.write(f"ifm-proxy answer: finish={finish_reason} content={len(content)} reasoning={len(reasoning)} tool_calls={len(tool_call_ids)}{note}\n")
 
 

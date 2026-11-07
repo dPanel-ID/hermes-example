@@ -29,7 +29,9 @@ agent:
     - project
     - search
   verbose: false
-  reasoning_effort: "medium"
+  # low keeps Telegram replies quick; IFM Horizon at medium can think for over
+  # a minute on a single tool step.
+  reasoning_effort: "low"
   personalities:
     helpful: You are a helpful, friendly AI assistant.
     concise: You are a concise assistant. Keep responses brief and to the point.
