@@ -22,8 +22,13 @@ export VENV_HERMES
 
 echo "Installing Hermes Agent to ${HERMES_HOME}..."
 
-# always copy the config.yaml to the hermes home directory
-cp -rf config.yaml "${HERMES_HOME}/config.yaml"
+# Install config.yaml into the Hermes home, keeping what Hermes saved there at
+# runtime (the home channel set with /sethome). Prefer the system Python,
+# which has PyYAML on Debian and Ubuntu; merge_config.py copies the file as
+# is when PyYAML is missing.
+mkdir -p "${HERMES_HOME}"
+CONFIG_PYTHON="$(command -v /usr/bin/python3 || command -v python3)"
+"${CONFIG_PYTHON}" "${CURRENT_DIR}/scripts/merge_config.py" config.yaml "${HERMES_HOME}/config.yaml"
 
 # Expose the API server layout globally
 # export API_SERVER_ENABLED=false
@@ -36,6 +41,13 @@ if [ "${API_SERVER_ENABLED}" = "true" ] && [ -z "${API_SERVER_KEY:-}" ]; then
     openssl rand -hex 32 >"$API_SERVER_KEY_FILE"
   fi
   export API_SERVER_KEY="$(cat "$API_SERVER_KEY_FILE")"
+fi
+
+# Telegram home channel: where Hermes delivers cron results and cross-platform
+# messages. Without one, Hermes asks for /sethome on the first message. With
+# exactly one allowed user, that user's private chat is the home channel.
+if [ -z "${TELEGRAM_HOME_CHANNEL:-}" ] && [ -n "${TELEGRAM_ALLOWED_USERS:-}" ] && [[ "${TELEGRAM_ALLOWED_USERS}" =~ ^[[:space:]]*[0-9]+[[:space:]]*$ ]]; then
+  export TELEGRAM_HOME_CHANNEL="${TELEGRAM_ALLOWED_USERS//[[:space:]]/}"
 fi
 
 # Telegram bot configuration

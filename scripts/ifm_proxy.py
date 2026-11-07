@@ -153,6 +153,13 @@ def open_upstream(method, path, body, headers):
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def handle(self):
+        # A client closing an idle keep-alive connection is normal, not an error.
+        try:
+            super().handle()
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+
     def log_message(self, fmt, *args):
         # Method, path and status only; never headers or bodies.
         sys.stderr.write("ifm-proxy %s\n" % (fmt % args))

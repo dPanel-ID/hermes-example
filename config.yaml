@@ -224,6 +224,11 @@ platform_toolsets:
     - hermes-teams
   google_chat:
     - hermes-google_chat
+# Side tasks such as chat titles run on the main model; IFM Horizon is a
+# reasoning model and can take longer than Hermes' 30 s default.
+auxiliary:
+  title_generation:
+    timeout: 120
 smart_model_routing:
   enabled: false
 known_plugin_toolsets:

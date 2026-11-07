@@ -66,6 +66,18 @@ GATEWAY_ALLOW_ALL_USERS=false
 TELEGRAM_ALLOWED_USERS=123456789,987654321
 ```
 
+Set a home channel, where Hermes delivers cron results and cross-platform
+messages, so it does not ask for one on the first message:
+
+```bash
+TELEGRAM_HOME_CHANNEL=123456789   # your user ID for a private chat, or a group ID
+```
+
+With exactly one user in `TELEGRAM_ALLOWED_USERS`, `scripts/start.sh` uses that
+user's private chat as the home channel. Otherwise type `/sethome` in the chat
+once; `scripts/start.sh` keeps it across restarts (`scripts/merge_config.py`
+installs `config.yaml` without dropping the saved home channel).
+
 In Telegram groups, mention the bot directly, for example:
 
 ```text
