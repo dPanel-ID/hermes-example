@@ -113,7 +113,9 @@ prompt_caching:
   cache_ttl: 5m
 display:
   compact: false
-  busy_input_mode: interrupt
+  # A message sent while Hermes is answering waits for its own turn instead
+  # of redirecting the running answer.
+  busy_input_mode: queue
   bell_on_complete: false
   # Reasoning stays out of the chat; only answers are sent.
   show_reasoning: false
