@@ -2,7 +2,23 @@
 
 export CURRENT_DIR=$(pwd)
 export HERMES_HOME="${CURRENT_DIR}/.hermes"
-export VENV_HERMES="${HERMES_HOME}/hermes-agent/venv/bin/hermes"
+
+# The Hermes installer has used two layouts: a venv in hermes-agent/venv
+# (older) and a launcher in hermes-agent/.hermes/bin (current).
+VENV_HERMES=""
+for candidate in \
+  "${HERMES_HOME}/hermes-agent/.hermes/bin/hermes" \
+  "${HERMES_HOME}/hermes-agent/venv/bin/hermes"; do
+  if [ -x "${candidate}" ]; then
+    VENV_HERMES="${candidate}"
+    break
+  fi
+done
+if [ -z "${VENV_HERMES}" ]; then
+  echo "Hermes is not installed in ${HERMES_HOME}; run ./scripts/build.sh first" >&2
+  exit 1
+fi
+export VENV_HERMES
 
 echo "Installing Hermes Agent to ${HERMES_HOME}..."
 
