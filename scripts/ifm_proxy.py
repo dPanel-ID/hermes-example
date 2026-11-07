@@ -19,6 +19,10 @@ rules dPanel's assistant applies (dPanel backend internal/ai/horizon):
 - requests that set no sampling get dPanel's: temperature 0.2, top_p 0.95
   and at most IFM_DEFAULT_MAX_TOKENS (4096) completion tokens; without them
   the model sometimes reasons until the token limit and never answers
+- assistant messages replayed without their reasoning get it back from the
+  answers this proxy relayed (matched by tool call id, else by content): the
+  model needs its earlier reasoning, and without it after tool calls it can
+  end with finish_reason tool_calls but no tool call and no answer
 - an answer whose content carries the model's reasoning followed by
   </ifm|think> (the gateway does this for some requests with tools) is split:
   the reasoning goes to reasoning_content, only the answer stays in content,
@@ -29,6 +33,8 @@ the API key. It listens on 127.0.0.1 only and needs nothing beyond the Python
 standard library.
 """
 
+import collections
+import hashlib
 import http.client
 import json
 import os
@@ -51,7 +57,10 @@ RETRYABLE = {429, 500, 502, 503, 504, 529}
 # Sampling dPanel's assistant sends (backend internal/ai/horizon/model.go).
 DEFAULT_TEMPERATURE = 0.2
 DEFAULT_TOP_P = 0.95
-DEFAULT_MAX_TOKENS = int(os.environ.get("IFM_DEFAULT_MAX_TOKENS", "4096"))
+# dPanel's assistant caps answers at 4096 tokens; an agent working through
+# tool calls reasons longer, so the default here is higher.
+DEFAULT_MAX_TOKENS = int(os.environ.get("IFM_DEFAULT_MAX_TOKENS", "16384"))
+REASONING_CACHE_ENTRIES = 4096
 # Hop-by-hop and recomputed headers are not forwarded.
 SKIP_HEADERS = {"host", "content-length", "connection", "keep-alive", "transfer-encoding", "accept-encoding"}
 
@@ -89,6 +98,71 @@ def fix_message(message):
     message["content"] = answer
     message["reasoning_content"] = combined
     message["reasoning"] = combined
+
+
+class ReasoningCache:
+    """Reasoning of relayed answers, keyed by tool call id or content digest,
+    bounded to the most recent REASONING_CACHE_ENTRIES keys."""
+
+    def __init__(self, limit=REASONING_CACHE_ENTRIES):
+        self.limit = limit
+        self.items = collections.OrderedDict()
+        self.lock = threading.Lock()
+
+    @staticmethod
+    def keys(content, tool_call_ids):
+        ids = [f"call:{i}" for i in tool_call_ids if i]
+        if ids:
+            return ids
+        content = (content or "").strip()
+        return [f"text:{hashlib.sha256(content.encode()).hexdigest()}"] if content else []
+
+    def remember(self, content, tool_call_ids, reasoning):
+        if not reasoning:
+            return
+        with self.lock:
+            for key in self.keys(content, tool_call_ids):
+                self.items[key] = reasoning
+                self.items.move_to_end(key)
+            while len(self.items) > self.limit:
+                self.items.popitem(last=False)
+
+    def recall(self, content, tool_call_ids):
+        with self.lock:
+            for key in self.keys(content, tool_call_ids):
+                if key in self.items:
+                    return self.items[key]
+        return ""
+
+
+REASONING = ReasoningCache()
+
+
+class StreamSummary:
+    """What a streamed answer contained, for the reasoning cache and the log."""
+
+    def __init__(self):
+        self.content = ""
+        self.reasoning = ""
+        self.tool_call_ids = []
+        self.finish_reason = None
+
+    def observe(self, line):
+        if not line.startswith(b"data:") or line[5:].strip() == b"[DONE]":
+            return
+        try:
+            choices = json.loads(line[5:]).get("choices") or []
+        except ValueError:
+            return
+        if not choices:
+            return
+        delta = choices[0].get("delta") or {}
+        self.content += delta.get("content") or ""
+        self.reasoning += delta.get("reasoning_content") or delta.get("reasoning") or ""
+        for call in delta.get("tool_calls") or []:
+            if call.get("id"):
+                self.tool_call_ids.append(call["id"])
+        self.finish_reason = choices[0].get("finish_reason") or self.finish_reason
 
 
 class StreamFixer:
@@ -184,6 +258,12 @@ def text_content(content):
     raise ContractError("unsupported_content_part", "Horizon supports text content only.")
 
 
+def log_answer(finish_reason, content, reasoning, tool_call_ids):
+    """One line per answer: sizes and outcome, never the text."""
+    note = " EMPTY" if not content and not tool_call_ids else ""
+    sys.stderr.write(f"ifm-proxy answer: finish={finish_reason} content={len(content)} reasoning={len(reasoning)} tool_calls={len(tool_call_ids)}{note}\n")
+
+
 def normalize_messages(messages):
     seen_tool_calls = set()
     for message in messages:
@@ -203,8 +283,11 @@ def normalize_messages(messages):
                     raise ContractError("invalid_tool_call", "Tool calls require a non-empty id and function name.")
                 seen_tool_calls.add(call_id)
             reasoning = message.get("reasoning_content")
-            if not isinstance(reasoning, str):
+            if not isinstance(reasoning, str) or not reasoning.strip():
                 reasoning = message.get("reasoning") if isinstance(message.get("reasoning"), str) else ""
+            if not reasoning.strip():
+                ids = [(call or {}).get("id") for call in message.get("tool_calls") or []]
+                reasoning = REASONING.recall(message["content"], ids)
             message["reasoning_content"] = reasoning
             message["reasoning"] = reasoning
         elif role == "tool":
@@ -227,6 +310,9 @@ def normalize_body(body):
     if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
         raise ContractError("unsupported_role", "Horizon Chat Completions requests require an array of messages.")
     normalize_messages(payload["messages"])
+    assistants = [m for m in payload["messages"] if m.get("role") == "assistant"]
+    with_reasoning = sum(1 for m in assistants if m.get("reasoning_content"))
+    sys.stderr.write(f"ifm-proxy request: messages={len(payload['messages'])} assistant_with_reasoning={with_reasoning}/{len(assistants)} tools={len(payload.get('tools') or [])} stream={bool(payload.get('stream'))}\n")
     payload.setdefault("temperature", DEFAULT_TEMPERATURE)
     payload.setdefault("top_p", DEFAULT_TOP_P)
     if "max_tokens" not in payload and "max_completion_tokens" not in payload:
@@ -347,20 +433,30 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 payload = json.loads(data)
                 for choice in payload.get("choices") or []:
-                    if isinstance(choice.get("message"), dict):
-                        fix_message(choice["message"])
+                    message = choice.get("message")
+                    if isinstance(message, dict):
+                        fix_message(message)
+                        ids = [(call or {}).get("id") for call in message.get("tool_calls") or []]
+                        reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+                        REASONING.remember(message.get("content"), ids, reasoning)
+                        log_answer(choice.get("finish_reason"), message.get("content") or "", reasoning, ids)
                 data = json.dumps(payload).encode()
             except ValueError:
                 pass
             self.write_chunk(data)
         elif completions and response.status == 200 and "text/event-stream" in content_type:
             fixer = StreamFixer()
+            summary = StreamSummary()
             while True:
                 line = response.readline()
                 if not line:
                     break
                 for out in fixer.feed(line.rstrip(b"\r\n")):
+                    for sent in out.split(b"\n"):
+                        summary.observe(sent)
                     self.write_chunk(out)
+            REASONING.remember(summary.content, summary.tool_call_ids, summary.reasoning)
+            log_answer(summary.finish_reason, summary.content, summary.reasoning, summary.tool_call_ids)
         else:
             while True:
                 chunk = response.read1(65536) if hasattr(response, "read1") else response.read(65536)
