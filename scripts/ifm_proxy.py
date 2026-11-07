@@ -16,6 +16,10 @@ rules dPanel's assistant applies (dPanel backend internal/ai/horizon):
 - requests start at least 1.1 seconds apart
 - 429 (honouring Retry-After), 500, 502, 503, 504 and 529 are retried up to
   three attempts, before any byte is sent back
+- an answer whose content carries the model's reasoning followed by
+  </ifm|think> (the gateway does this for some requests with tools) is split:
+  the reasoning goes to reasoning_content, only the answer stays in content,
+  for both plain and streamed responses
 
 The client's Authorization header is passed through, so the proxy never holds
 the API key. It listens on 127.0.0.1 only and needs nothing beyond the Python
@@ -26,6 +30,7 @@ import http.client
 import json
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -46,6 +51,101 @@ SKIP_HEADERS = {"host", "content-length", "connection", "keep-alive", "transfer-
 _upstream = urlsplit(UPSTREAM)
 _pace_lock = threading.Lock()
 _next_start = 0.0
+
+
+THINK_CLOSE = "</ifm|think>"
+THINK_OPEN = re.compile(r"^\s*<ifm\|think>")
+
+
+def split_reasoning(content):
+    """Return (reasoning, answer) when content holds reasoning ended by the
+    closing think tag, else None."""
+    index = content.find(THINK_CLOSE)
+    if index < 0:
+        return None
+    reasoning = THINK_OPEN.sub("", content[:index]).strip()
+    answer = content[index + len(THINK_CLOSE):].lstrip()
+    return reasoning, answer
+
+
+def fix_message(message):
+    """Move leaked reasoning out of a non-streamed assistant message."""
+    content = message.get("content")
+    if not isinstance(content, str):
+        return
+    parts = split_reasoning(content)
+    if parts is None:
+        return
+    reasoning, answer = parts
+    earlier = message.get("reasoning_content") or message.get("reasoning") or ""
+    combined = (earlier + "\n" + reasoning).strip() if earlier else reasoning
+    message["content"] = answer
+    message["reasoning_content"] = combined
+    message["reasoning"] = combined
+
+
+class StreamFixer:
+    """Hold back streamed content until it is clear whether it starts with
+    leaked reasoning: once the closing think tag arrives the held text is sent
+    as reasoning and the rest as content; at the end of the answer without a
+    tag, the held text is sent as content unchanged."""
+
+    def __init__(self):
+        self.held = ""
+        self.passing = False
+        self.template = None
+
+    def _event(self, delta, finish_reason=None):
+        event = {key: self.template[key] for key in ("id", "object", "created", "model") if key in self.template}
+        event["choices"] = [{"index": 0, "delta": delta, "finish_reason": finish_reason}]
+        return b"data: " + json.dumps(event).encode() + b"\n\n"
+
+    def _flush(self):
+        out = []
+        if self.held:
+            parts = split_reasoning(self.held)
+            if parts is None:
+                out.append(self._event({"content": self.held}))
+            else:
+                if parts[0]:
+                    out.append(self._event({"reasoning_content": parts[0], "reasoning": parts[0]}))
+                if parts[1]:
+                    out.append(self._event({"content": parts[1]}))
+        self.held = ""
+        self.passing = True
+        return out
+
+    def feed(self, line):
+        """Take one SSE line (without newline); return the bytes to send."""
+        if not line.startswith(b"data:"):
+            return [line + b"\n"]
+        payload = line[5:].strip()
+        if payload == b"[DONE]":
+            out = [] if self.passing or self.template is None else self._flush()
+            return out + [line + b"\n"]
+        try:
+            event = json.loads(payload)
+        except ValueError:
+            return [line + b"\n"]
+        choices = event.get("choices") or []
+        if self.passing or not choices:
+            return [line + b"\n"]
+        self.template = event
+        choice = choices[0]
+        delta = choice.get("delta") or {}
+        content = delta.pop("content", None)
+        out = []
+        if content:
+            self.held += content
+            if THINK_CLOSE in self.held:
+                out.extend(self._flush())
+        if choice.get("finish_reason") is not None or delta.get("tool_calls"):
+            # The answer is complete, or a tool call follows: release what is held.
+            if not self.passing:
+                out.extend(self._flush())
+        if delta or choice.get("finish_reason") is not None:
+            out.append(b"data: " + json.dumps(event).encode() + b"\n")
+        return out
 
 
 class ContractError(Exception):
@@ -207,24 +307,50 @@ class Handler(BaseHTTPRequestHandler):
                 connection.close()
                 time.sleep(retry_delay(response.status, response.headers, attempt))
                 continue
-            self.relay(response)
+            self.relay(response, completions=method == "POST" and path.rstrip("/").endswith("/chat/completions"))
             connection.close()
             return
 
-    def relay(self, response):
-        """Stream the gateway's answer back as it arrives (SSE included)."""
+    def write_chunk(self, data):
+        if data:
+            self.wfile.write(b"%x\r\n%s\r\n" % (len(data), data))
+            self.wfile.flush()
+
+    def relay(self, response, completions=False):
+        """Send the gateway's answer back; chat completions are checked for
+        reasoning leaked into content, everything else streams through."""
+        content_type = response.getheader("Content-Type") or ""
         self.send_response(response.status)
         for key, value in response.getheaders():
             if key.lower() not in SKIP_HEADERS:
                 self.send_header(key, value)
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
-        while True:
-            chunk = response.read1(65536) if hasattr(response, "read1") else response.read(65536)
-            if not chunk:
-                break
-            self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))
-            self.wfile.flush()
+        if completions and response.status == 200 and "application/json" in content_type:
+            data = response.read()
+            try:
+                payload = json.loads(data)
+                for choice in payload.get("choices") or []:
+                    if isinstance(choice.get("message"), dict):
+                        fix_message(choice["message"])
+                data = json.dumps(payload).encode()
+            except ValueError:
+                pass
+            self.write_chunk(data)
+        elif completions and response.status == 200 and "text/event-stream" in content_type:
+            fixer = StreamFixer()
+            while True:
+                line = response.readline()
+                if not line:
+                    break
+                for out in fixer.feed(line.rstrip(b"\r\n")):
+                    self.write_chunk(out)
+        else:
+            while True:
+                chunk = response.read1(65536) if hasattr(response, "read1") else response.read(65536)
+                if not chunk:
+                    break
+                self.write_chunk(chunk)
         self.wfile.write(b"0\r\n\r\n")
         self.wfile.flush()
 

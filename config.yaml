@@ -115,7 +115,8 @@ display:
   compact: false
   busy_input_mode: interrupt
   bell_on_complete: false
-  show_reasoning: true
+  # Reasoning stays out of the chat; only answers are sent.
+  show_reasoning: false
   streaming: true
   skin: default
   interim_assistant_messages: true
